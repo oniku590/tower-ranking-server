@@ -39,10 +39,17 @@ function saveRankings(data) {
 const PLAYER_LEVEL_CAP = 3000;
 const VALID_NAME_COLORS = ['white', 'blue', 'yellow', 'purple', 'green', 'red', 'silver', 'gold', 'rainbow'];
 
+// 1フロアあたり、現実的にありえる最短時間（秒）。アプリ側は「累計プレイ時間」を
+// elapsedSecondsとして送ってくる（1回のプレイだけでなく、過去の失敗・やり直し分も
+// 含めた合計値）。bestFloorに対してこの最低ラインを大きく下回る申告は、チートや
+// 改ざんの可能性が高いとみなして拒否する。速いプレイヤーを誤って弾かないよう、
+// あくまで「明らかにおかしい」ものだけを弾くゆるめの閾値にしてある。
+const MIN_SECONDS_PER_FLOOR = 1.5;
+
 // スコアを登録・更新する。既存の記録より低い場合は更新しない
 // （＝自己ベストだけが常に保存される）。level・nameColorは自己ベストの更新有無に関わらず常に最新化する。
 app.post('/api/scores', (req, res) => {
-  const { playerId, name, bestFloor, ability, level, nameColor } = req.body;
+  const { playerId, name, bestFloor, ability, level, nameColor, elapsedSeconds } = req.body;
 
   if (typeof playerId !== 'string' || playerId.length < 1 || playerId.length > 64) {
     return res.status(400).json({ error: 'invalid playerId' });
@@ -52,6 +59,17 @@ app.post('/api/scores', (req, res) => {
   }
   if (!Number.isInteger(bestFloor) || bestFloor < 1 || bestFloor > 100000) {
     return res.status(400).json({ error: 'invalid bestFloor' });
+  }
+  // elapsedSecondsは新しいアプリだけが送ってくる想定のフィールド。古いアプリからの
+  // リクエストにも対応できるよう、送られてきた時だけ検証する（必須にはしない）。
+  if (elapsedSeconds !== null && elapsedSeconds !== undefined) {
+    if (typeof elapsedSeconds !== 'number' || !Number.isFinite(elapsedSeconds) || elapsedSeconds < 0) {
+      return res.status(400).json({ error: 'invalid elapsedSeconds' });
+    }
+    if (elapsedSeconds < bestFloor * MIN_SECONDS_PER_FLOOR) {
+      console.log(`⚠️ 不自然に速いスコア申告を拒否: playerId=${playerId}, bestFloor=${bestFloor}, elapsedSeconds=${elapsedSeconds}`);
+      return res.status(400).json({ error: 'implausible elapsedSeconds for bestFloor' });
+    }
   }
   // ability は現状 null 固定だが、将来のために「null または 32文字以内の文字列」を許容しておく
   if (ability !== null && ability !== undefined && (typeof ability !== 'string' || ability.length > 32)) {
