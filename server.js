@@ -16,8 +16,41 @@ app.use(express.json());
 
 const DATA_FILE = path.join(__dirname, 'rankings.json');
 
+// ================================================================
+//  シード（ダミー）ランキング
+// ================================================================
+// リリース直後、本当に誰もランキングに登録していない状態だと寂しく見えるので、
+// 「たたき台」として何人か架空のプレイヤーを最初から登録しておく。
+// playerIdには本物のプレイヤーID（アプリ側でランダム生成）と絶対に被らないよう
+// "seed-" という接頭辞を付けてあるので、実プレイヤーのデータと混同する心配はない。
+// 無能力（ability: 'none'）で登録している数人は、アプリ側の「無能力縛りは金枠になる」
+// 表示のサンプルも兼ねている。
+// bestFloorは10F〜200Fの間でばらつかせてある（強すぎるとリリース直後の見栄えとして
+// 不自然なので、ほどよく現実的な範囲にとどめている）。levelはおまけ表示なので厳密でなくてよい。
+const SEED_RANKINGS = {
+  'seed-01': { name: '灰色の狼',       bestFloor: 195, ability: 'none',    level: 40, nameColor: 'gold',   updatedAt: 0 },
+  'seed-02': { name: '月見うさぎ',     bestFloor: 175, ability: 'shotgun', level: 36, nameColor: 'blue',   updatedAt: 0 },
+  'seed-03': { name: '鉄壁太郎',       bestFloor: 150, ability: 'barrier', level: 31, nameColor: 'white',  updatedAt: 0 },
+  'seed-04': { name: '無音の探索者',   bestFloor: 130, ability: 'none',    level: 27, nameColor: 'silver', updatedAt: 0 },
+  'seed-05': { name: 'コーヒー中毒',   bestFloor: 112, ability: 'shotgun', level: 23, nameColor: 'white',  updatedAt: 0 },
+  'seed-06': { name: '夜更かし勢',     bestFloor: 96,  ability: 'barrier', level: 20, nameColor: 'purple', updatedAt: 0 },
+  'seed-07': { name: 'そらまめ',       bestFloor: 80,  ability: 'none',    level: 17, nameColor: 'green',  updatedAt: 0 },
+  'seed-08': { name: 'ぴよ次郎',       bestFloor: 65,  ability: 'shotgun', level: 14, nameColor: 'white',  updatedAt: 0 },
+  'seed-09': { name: '静かな刃',       bestFloor: 50,  ability: 'none',    level: 11, nameColor: 'white',  updatedAt: 0 },
+  'seed-10': { name: 'たぬきの皮算用', bestFloor: 38,  ability: 'barrier', level: 9,  nameColor: 'yellow', updatedAt: 0 },
+  'seed-11': { name: '初心者卒業',     bestFloor: 24,  ability: 'shotgun', level: 6,  nameColor: 'white',  updatedAt: 0 },
+  'seed-12': { name: '駆け出し冒険者', bestFloor: 12,  ability: 'none',    level: 3,  nameColor: 'white',  updatedAt: 0 },
+};
+
+// データファイルが存在しない場合（初回起動、または無料プランのファイルシステムが
+// リセットされた直後）は、上のシードデータで初期化する。一度でも実プレイヤーの
+// スコアが送信されてファイルができれば、以降はそのファイルがそのまま使われるので、
+// シードで実データが上書きされることはない。
 function loadRankings() {
-  if (!fs.existsSync(DATA_FILE)) return {};
+  if (!fs.existsSync(DATA_FILE)) {
+    saveRankings(SEED_RANKINGS);
+    return JSON.parse(JSON.stringify(SEED_RANKINGS));
+  }
   try {
     return JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
   } catch {
@@ -117,22 +150,73 @@ app.post('/api/scores', (req, res) => {
   res.json({ ok: true, best: rankings[playerId].bestFloor });
 });
 
-// ランキング一覧を取得する（自己ベストの高い順、上位100件まで）
+// ================================================================
+//  ランキングの並び順・順位付け（共通ロジック）
+// ================================================================
+// 同じ階数で並んだ場合は、無能力（ability: 'none'）で登った人を上位にする
+// （能力に頼らず登った方が「格上」という扱い）。それでも決まらない場合は
+// playerIdで固定し、同じ状態なら毎回同じ順番になるようにする。
+function compareRankingEntries(a, b) {
+  if (b.bestFloor !== a.bestFloor) return b.bestFloor - a.bestFloor;
+  const aNone = a.ability === 'none' ? 0 : 1;
+  const bNone = b.ability === 'none' ? 0 : 1;
+  if (aNone !== bNone) return aNone - bNone;
+  return a.playerId < b.playerId ? -1 : a.playerId > b.playerId ? 1 : 0;
+}
+
+// rankingsオブジェクト（{playerId: {...}}）から、必要なら能力IDで絞り込んだ上で、
+// 順位（1位から始まる連番、rankフィールド）付きの配列にして返す。
+// TOP50・無能力・自分の順位、どのタブも最終的にこの1つの並び順を元にしているので、
+// 「同じ階数なら無能力が上」のルールが全タブで一貫する。
+function getRankedList(rankings, { ability } = {}) {
+  let list = Object.entries(rankings).map(([playerId, r]) => ({
+    playerId,
+    name: r.name,
+    bestFloor: r.bestFloor,
+    ability: r.ability || null,
+    level: r.level || null,
+    nameColor: r.nameColor || null,
+  }));
+  if (ability) list = list.filter((r) => r.ability === ability);
+  list.sort(compareRankingEntries);
+  list.forEach((r, i) => { r.rank = i + 1; });
+  return list;
+}
+
+// ランキング一覧を取得する（自己ベストの高い順、デフォルト上位100件まで）。
+// ?limit=50 で件数を絞れる（TOP50タブ用）。?ability=none のように能力IDで
+// 絞り込むこともできる（無能力タブ用）。どちらも省略時は今まで通りの全体ランキング。
 app.get('/api/rankings', (req, res) => {
   const rankings = loadRankings();
-  const list = Object.entries(rankings)
-    .map(([playerId, r]) => ({
-      playerId,
-      name: r.name,
-      bestFloor: r.bestFloor,
-      ability: r.ability || null,
-      level: r.level || null,
-      nameColor: r.nameColor || null,
-    }))
-    .sort((a, b) => b.bestFloor - a.bestFloor)
-    .slice(0, 100);
+  const abilityFilter = typeof req.query.ability === 'string' ? req.query.ability : null;
+  let limit = parseInt(req.query.limit, 10);
+  if (!Number.isInteger(limit) || limit < 1) limit = 100;
+  limit = Math.min(limit, 200); // 念のための上限
 
-  res.json({ rankings: list });
+  const list = getRankedList(rankings, { ability: abilityFilter });
+  res.json({ rankings: list.slice(0, limit), total: list.length });
+});
+
+// 指定したプレイヤーを中心に、その前後25人ずつ（自分含めて最大51人）を返す（自分の順位タブ用）。
+// 自分が1位の場合は上に誰もいないので、その分は単純に下側の枠が広がる（詰めない）。
+// まだそのプレイヤーの記録がサーバーに無い場合は404を返す。
+const RANKING_AROUND_SPAN = 25;
+app.get('/api/rankings/around/:playerId', (req, res) => {
+  const { playerId } = req.params;
+  if (typeof playerId !== 'string' || playerId.length < 1 || playerId.length > 64) {
+    return res.status(400).json({ error: 'invalid playerId' });
+  }
+
+  const rankings = loadRankings();
+  const list = getRankedList(rankings); // 自分の順位タブは能力での絞り込みなし＝全体の中での順位
+  const idx = list.findIndex((r) => r.playerId === playerId);
+  if (idx === -1) {
+    return res.status(404).json({ error: 'player not found' });
+  }
+
+  const start = Math.max(0, idx - RANKING_AROUND_SPAN);
+  const end = Math.min(list.length, idx + RANKING_AROUND_SPAN + 1);
+  res.json({ rankings: list.slice(start, end), myRank: idx + 1, total: list.length });
 });
 
 // 指定したプレイヤーの記録を削除する（アプリ側の「データ削除」と連動させるため）
