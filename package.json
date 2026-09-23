@@ -1,13 +1,18 @@
 {
-  "name": "tower-ranking-server",
+  "name": "ranking-server-fix",
   "version": "1.0.0",
-  "description": "MINE SWEEPER 極 - 極の塔ランキングAPI",
+  "description": "",
   "main": "server.js",
   "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node server.js"
   },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
   "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.21.2"
+    "@upstash/redis": "^1.38.4",
+    "cors": "^2.8.6",
+    "express": "^5.2.1"
   }
 }
