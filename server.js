@@ -2,19 +2,28 @@
 //  極の塔 ランキングサーバー
 // ================================================================
 // シンプルなREST API。プレイヤーごとの自己ベスト（踏破フロア数）を
-// 記録・取得するだけの最小構成。データはJSONファイルに保存する
-// （本格運用で書き込みが増えてきたら、SQLite等への切り替えも検討）。
+// 記録・取得するだけの最小構成。データはUpstash Redis（無料枠）に保存する。
+//
+// ※以前はJSONファイル（rankings.json）に保存していたが、Renderの無料プランは
+//   スリープ復帰や再デプロイのたびにローカルファイルが消えてしまう仕様のため、
+//   時間が経つと記録が消えるバグの原因になっていた。そのため、外部の永続ストレージ
+//   （Upstash Redis）に保存する形に変更してある。保存先が変わっただけで、
+//   ランキングのロジック（シード・検証・並び順など）は元のまま。
+//
+// 必要な環境変数（Renderの「Environment」タブで設定）：
+//   UPSTASH_REDIS_REST_URL
+//   UPSTASH_REDIS_REST_TOKEN
 
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
+const { Redis } = require('@upstash/redis');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const DATA_FILE = path.join(__dirname, 'rankings.json');
+const redis = Redis.fromEnv();
+const RANKINGS_KEY = 'ms-tower-rankings'; // ランキングデータ全体を、この1つのキーにJSON文字列として保存する
 
 // ================================================================
 //  シード（ダミー）ランキング
@@ -42,24 +51,28 @@ const SEED_RANKINGS = {
   'seed-12': { name: '駆け出し冒険者', bestFloor: 12,  ability: 'none',    level: 3,  nameColor: 'white',  updatedAt: 0 },
 };
 
-// データファイルが存在しない場合（初回起動、または無料プランのファイルシステムが
-// リセットされた直後）は、上のシードデータで初期化する。一度でも実プレイヤーの
-// スコアが送信されてファイルができれば、以降はそのファイルがそのまま使われるので、
-// シードで実データが上書きされることはない。
-function loadRankings() {
-  if (!fs.existsSync(DATA_FILE)) {
-    saveRankings(SEED_RANKINGS);
+// Upstashにまだ何も保存されていない場合（初回起動）は、上のシードデータで初期化する。
+// 一度でも実プレイヤーのスコアが送信されて保存されれば、以降はその保存済みデータが
+// そのまま使われるので、シードで実データが上書きされることはない。
+async function loadRankings() {
+  let data;
+  try {
+    data = await redis.get(RANKINGS_KEY);
+  } catch (e) {
+    console.log('⚠️ Upstashからの読み込みに失敗', e);
+    data = null;
+  }
+  if (data === null || data === undefined) {
+    await saveRankings(SEED_RANKINGS);
     return JSON.parse(JSON.stringify(SEED_RANKINGS));
   }
-  try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
-  } catch {
-    return {};
-  }
+  // @upstash/redisのバージョンによって、オブジェクトのまま返ることもJSON文字列のまま
+  // 返ることもあり得るため、どちらのケースでも動くようにしておく。
+  return typeof data === 'string' ? JSON.parse(data) : data;
 }
 
-function saveRankings(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+async function saveRankings(data) {
+  await redis.set(RANKINGS_KEY, JSON.stringify(data));
 }
 
 // { playerId: { name, bestFloor, ability, level, nameColor, updatedAt } } という形で保存する。
@@ -81,7 +94,7 @@ const MIN_SECONDS_PER_FLOOR = 1.5;
 
 // スコアを登録・更新する。既存の記録より低い場合は更新しない
 // （＝自己ベストだけが常に保存される）。level・nameColorは自己ベストの更新有無に関わらず常に最新化する。
-app.post('/api/scores', (req, res) => {
+app.post('/api/scores', async (req, res) => {
   const { playerId, name, bestFloor, ability, level, nameColor, elapsedSeconds } = req.body;
 
   if (typeof playerId !== 'string' || playerId.length < 1 || playerId.length > 64) {
@@ -124,7 +137,7 @@ app.post('/api/scores', (req, res) => {
     safeNameColor = nameColor;
   }
 
-  const rankings = loadRankings();
+  const rankings = await loadRankings();
   const existing = rankings[playerId];
 
   if (!existing || bestFloor > existing.bestFloor || name !== existing.name) {
@@ -137,14 +150,14 @@ app.post('/api/scores', (req, res) => {
       nameColor: safeNameColor,
       updatedAt: Date.now(),
     };
-    saveRankings(rankings);
+    await saveRankings(rankings);
   } else if (existing.level !== safeLevel || existing.nameColor !== safeNameColor) {
     // 自己ベストは更新されなかったが、レベル・名前の色だけは常に最新化しておく
     // （プロフィール画面で色を変えた／デイリーでレベルが上がった時に、次の送信ですぐ反映されるように）
     existing.level = safeLevel;
     existing.nameColor = safeNameColor;
     existing.updatedAt = Date.now();
-    saveRankings(rankings);
+    await saveRankings(rankings);
   }
 
   res.json({ ok: true, best: rankings[playerId].bestFloor });
@@ -186,8 +199,8 @@ function getRankedList(rankings, { ability } = {}) {
 // ランキング一覧を取得する（自己ベストの高い順、デフォルト上位100件まで）。
 // ?limit=50 で件数を絞れる（TOP50タブ用）。?ability=none のように能力IDで
 // 絞り込むこともできる（無能力タブ用）。どちらも省略時は今まで通りの全体ランキング。
-app.get('/api/rankings', (req, res) => {
-  const rankings = loadRankings();
+app.get('/api/rankings', async (req, res) => {
+  const rankings = await loadRankings();
   const abilityFilter = typeof req.query.ability === 'string' ? req.query.ability : null;
   let limit = parseInt(req.query.limit, 10);
   if (!Number.isInteger(limit) || limit < 1) limit = 100;
@@ -201,13 +214,13 @@ app.get('/api/rankings', (req, res) => {
 // 自分が1位の場合は上に誰もいないので、その分は単純に下側の枠が広がる（詰めない）。
 // まだそのプレイヤーの記録がサーバーに無い場合は404を返す。
 const RANKING_AROUND_SPAN = 25;
-app.get('/api/rankings/around/:playerId', (req, res) => {
+app.get('/api/rankings/around/:playerId', async (req, res) => {
   const { playerId } = req.params;
   if (typeof playerId !== 'string' || playerId.length < 1 || playerId.length > 64) {
     return res.status(400).json({ error: 'invalid playerId' });
   }
 
-  const rankings = loadRankings();
+  const rankings = await loadRankings();
   const list = getRankedList(rankings); // 自分の順位タブは能力での絞り込みなし＝全体の中での順位
   const idx = list.findIndex((r) => r.playerId === playerId);
   if (idx === -1) {
@@ -220,16 +233,16 @@ app.get('/api/rankings/around/:playerId', (req, res) => {
 });
 
 // 指定したプレイヤーの記録を削除する（アプリ側の「データ削除」と連動させるため）
-app.delete('/api/scores/:playerId', (req, res) => {
+app.delete('/api/scores/:playerId', async (req, res) => {
   const { playerId } = req.params;
   if (typeof playerId !== 'string' || playerId.length < 1 || playerId.length > 64) {
     return res.status(400).json({ error: 'invalid playerId' });
   }
 
-  const rankings = loadRankings();
+  const rankings = await loadRankings();
   if (rankings[playerId]) {
     delete rankings[playerId];
-    saveRankings(rankings);
+    await saveRankings(rankings);
   }
 
   res.json({ ok: true });
